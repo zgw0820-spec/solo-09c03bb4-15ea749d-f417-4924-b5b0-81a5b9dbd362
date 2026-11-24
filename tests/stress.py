@@ -9,6 +9,7 @@ import asyncio
 import os
 import random
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -49,6 +50,18 @@ async def wait_health(base: str) -> None:
                 pass
             await asyncio.sleep(0.2)
     raise RuntimeError(f"not ready: {base}")
+
+
+def restart_proxy(proc: subprocess.Popen, port: int, origin_port: int, cache_dir: str) -> subprocess.Popen:
+    """SIGKILL 强制终止后用同一缓存卷重启代理。"""
+    if proc.poll() is None:
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(timeout=10)
+    return start_server(
+        "proxy", port,
+        {"ORIGIN_BASE": f"http://127.0.0.1:{origin_port}",
+         "CACHE_DIR": cache_dir, "FETCH_MAX_RETRIES": "3",
+         "HTTP_TIMEOUT": "10", "CACHE_MAX_VERSIONS": "10"})
 
 
 async def main() -> int:
@@ -107,17 +120,52 @@ async def main() -> int:
             ostats_after = (await http.get(f"http://127.0.0.1:{origin_port}/stats")).json()["stats"]
             pstats = (await http.get(f"http://127.0.0.1:{proxy_port}/stats")).json()
 
+            # 第三轮：SIGKILL 强杀代理、同一缓存卷重启，持久化覆盖应继续零回源命中
+            proxy = restart_proxy(proxy, proxy_port, origin_port, cache_dir)
+            await wait_health(f"http://127.0.0.1:{proxy_port}")
+            await http.post(f"http://127.0.0.1:{origin_port}/admin/fault",
+                            json={"mode": "none"})
+            ostats_before_restart = (
+                await http.get(f"http://127.0.0.1:{origin_port}/stats")
+            ).json()["stats"]
+            restart_results = await asyncio.gather(*[fetch_one(r) for r in ranges])
+            ostats_after_restart = (
+                await http.get(f"http://127.0.0.1:{origin_port}/stats")
+            ).json()["stats"]
+            restart_mismatches = 0
+            for (start, end, content, _), (r_start, r_end, r_content, _) in zip(
+                proxy_results, restart_results
+            ):
+                truth = await http.get(
+                    f"http://127.0.0.1:{origin_port}/video",
+                    headers={"Range": f"bytes={start}-{end}"},
+                )
+                if r_content != content or r_content != truth.content:
+                    restart_mismatches += 1
+            pstats_restart = (await http.get(f"http://127.0.0.1:{proxy_port}/stats")).json()
+
             print(f"区间请求数: {len(ranges)}")
             print(f"第一轮并发耗时: {proxy_elapsed:.2f}s")
             print(f"字节不一致段数: {mismatches}")
             print(f"第二轮源站新增区间请求: "
                   f"{ostats_after['range_requests'] - ostats_before['range_requests']}")
+            print(
+                "强杀重启后第三轮源站新增区间请求: "
+                f"{ostats_after_restart['range_requests'] - ostats_before_restart['range_requests']}"
+            )
+            print(f"重启后字节不一致段数: {restart_mismatches}")
+            print(f"重启后代理恢复统计: restored_versions={pstats_restart.get('restored_versions')} "
+                  f"cold_cache_resets={pstats_restart.get('cold_cache_resets')}")
             print(f"源站峰值并发区间数: {ostats_after['max_concurrent_range']}")
             print(f"代理统计: {pstats}")
 
             ok = (
                 mismatches == 0
                 and ostats_after["range_requests"] == ostats_before["range_requests"]
+                and ostats_after_restart["range_requests"]
+                == ostats_before_restart["range_requests"]
+                and restart_mismatches == 0
+                and pstats_restart.get("restored_versions", 0) >= 1
                 and ostats_after["max_concurrent_range"] >= 2
             )
             print("STRESS PASS ✅" if ok else "STRESS FAIL ❌")

@@ -6,6 +6,7 @@
 - /admin/fault 注入故障：
     truncate        回包截断（持续，直到 fault=none）
     truncate_once   下一次区间响应截断一次
+    truncate_range  仅对命中指定闭区间（fault_range=[start,end]）的请求持续截断
     swap_during     下一次区间响应在发送前换片（ETag 与 Content-Range 不匹配）
     delay           区间响应延迟 N 秒（默认 0.5s）
     none            清除故障
@@ -152,6 +153,19 @@ async def video(request: Request) -> Response:
             payload = content[start : max(start, end - 64)]  # 少发若干字节
         elif mode == "truncate":
             payload = content[start : max(start, end - 64)]
+        elif mode == "truncate_range":
+            # 只截断与 fault_range 有重叠的请求，其余请求正常（自测并行隔离用）
+            fault_range = _fault.get("fault_range")
+            hit = (
+                isinstance(fault_range, list)
+                and len(fault_range) == 2
+                and start <= int(fault_range[1])
+                and end >= int(fault_range[0])
+            )
+            if hit:
+                payload = content[start : max(start, end - 64)]
+            else:
+                payload = content[start : end + 1]
         else:
             payload = content[start : end + 1]
 
@@ -232,11 +246,29 @@ async def fault(request: Request) -> JSONResponse:
     except Exception:  # noqa: BLE001
         pass
     mode = body.get("mode", "none")
-    if mode not in {"none", "truncate", "truncate_once", "swap_during", "delay"}:
+    if mode not in {
+        "none",
+        "truncate",
+        "truncate_once",
+        "truncate_range",
+        "swap_during",
+        "delay",
+    }:
         return JSONResponse(status_code=400, content={"error": "unknown_mode"})
     _fault["mode"] = mode
     if "delay" in body:
         _fault["delay"] = float(body["delay"])  # type: ignore[arg-type]
+    if "fault_range" in body:
+        fault_range = body["fault_range"]
+        if (
+            not isinstance(fault_range, list)
+            or len(fault_range) != 2
+            or int(fault_range[0]) > int(fault_range[1])
+        ):
+            return JSONResponse(
+                status_code=400, content={"error": "bad_fault_range"}
+            )
+        _fault["fault_range"] = [int(fault_range[0]), int(fault_range[1])]
     return JSONResponse({"ok": True, "fault": dict(_fault)})
 
 

@@ -14,8 +14,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -73,6 +75,25 @@ def start_server(app_dir: str, port: int, env: dict[str, str]) -> subprocess.Pop
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+    )
+    return proc
+
+
+def restart_proxy(proc: subprocess.Popen, port: int, origin_port: int, cache_dir: str) -> subprocess.Popen:
+    """强制终止代理（SIGKILL，模拟被 kill -9 / 容器强杀），用同一缓存卷重启。"""
+    if proc.poll() is None:
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(timeout=10)
+    proc = start_server(
+        "proxy",
+        port,
+        {
+            "ORIGIN_BASE": f"http://127.0.0.1:{origin_port}",
+            "CACHE_DIR": cache_dir,
+            "FETCH_MAX_RETRIES": "3",
+            "HTTP_TIMEOUT": "10",
+            "CACHE_MAX_VERSIONS": "10",
+        },
     )
     return proc
 
@@ -281,6 +302,183 @@ async def main() -> int:
                       resp.status_code == expect, f"actual={resp.status_code}")
             resp = await http.get(f"{proxy}/video")
             check("F 缺失 Range 头 -> 400", resp.status_code == 400)
+
+            # ---------- G. 强制重启后的持久化覆盖与冷缓存规则 ----------
+            print("\n== G. 持久化覆盖 / 强制重启 / 冷缓存 / 失败不登记 ==")
+            await reset(origin, f"{proxy}/stats")
+            await http.post(f"{origin}/admin/swap", json={"version": "v1"})
+            etag_v1_current = (await http.get(f"{origin}/stats")).json()["etag"]
+
+            # G1/G2：先取两段不相邻区间，确认覆盖记录已落盘
+            await http.post(f"{origin}/admin/reset-stats")
+            r_g1 = await http.get(f"{proxy}/video", headers={"Range": "bytes=100000-100999"})
+            r_g2 = await http.get(f"{proxy}/video", headers={"Range": "bytes=200000-200999"})
+            check("G1 两个区间首次请求均 206", r_g1.status_code == 206 and r_g2.status_code == 206)
+            state_before = (await http.get(f"{proxy}/cache/state")).json()
+            meta_files = list(Path(cache_dir).glob("*/covered.json"))
+            v1_state = next(v for v in state_before["versions"] if v["etag"] == etag_v1_current)
+            check("G2 覆盖记录 covered.json 已随版本落盘，且包含两个新区间",
+                  len(meta_files) >= 1
+                  and [100000, 100999] in v1_state["covered"]
+                  and [200000, 200999] in v1_state["covered"],
+                  f"meta={[str(p) for p in meta_files]} covered={v1_state['covered']}")
+            v1_meta = next(
+                p for p in meta_files
+                if json.loads(p.read_text())["etag"] == etag_v1_current
+            )
+            record_on_disk = json.loads(v1_meta.read_text())
+            check("G2b 覆盖记录包含强 ETag、总长度与区间",
+                  record_on_disk["total_length"] == 1048576
+                  and isinstance(record_on_disk["etag"], str)
+                  and len(record_on_disk["etag"]) == 64
+                  and [100000, 100999] in record_on_disk["covered"]
+                  and [200000, 200999] in record_on_disk["covered"])
+
+            # G3：SIGKILL 强制终止代理，用同一缓存卷重启，此前 206 过的区间零回源命中
+            proxy_proc = restart_proxy(proxy_proc, proxy_port, origin_port, cache_dir)
+            await wait_health(proxy)
+            await http.post(f"{origin}/admin/reset-stats")
+            r_hit1 = await http.get(f"{proxy}/video", headers={"Range": "bytes=100000-100999"})
+            r_hit2 = await http.get(f"{proxy}/video", headers={"Range": "bytes=200000-200999"})
+            ostats_g3 = (await http.get(f"{origin}/stats")).json()["stats"]
+            check("G3 强杀重启后历史 206 区间零回源命中（源站 GET 区间计数为 0）",
+                  r_hit1.status_code == 206 and r_hit2.status_code == 206
+                  and ostats_g3["range_requests"] == 0
+                  and ostats_g3["bytes_sent"] == 0
+                  and r_hit1.content == r_g1.content and r_hit2.content == r_g2.content,
+                  f"origin range_requests={ostats_g3['range_requests']}")
+            pstats_g3 = (await http.get(f"{proxy}/stats")).json()
+            check("G3b 恢复时统计到 restored_versions，且未触发冷缓存重建",
+                  pstats_g3["restored_versions"] >= 1 and pstats_g3["cold_cache_resets"] == 0,
+                  f"stats={pstats_g3}")
+
+            # G4：请求跨过已存区间，只回源补缺口（HEAD 不算 GET 取字节）
+            r_span = await http.get(f"{proxy}/video", headers={"Range": "bytes=99500-101499"})
+            ostats_g4 = (await http.get(f"{origin}/stats")).json()["stats"]
+            check("G4 跨已存区间只补两侧缺口（源站仅 2 次区间请求、共 1000 字节）",
+                  r_span.status_code == 206
+                  and ostats_g4["range_requests"] == 2
+                  and ostats_g4["bytes_sent"] == 1000,
+                  f"range_requests={ostats_g4['range_requests']} bytes={ostats_g4['bytes_sent']}")
+            truth_g4 = await http.get(f"{origin}/video", headers={"Range": "bytes=99500-101499"})
+            check("G4b 合并区间字节与源站一致", r_span.content == truth_g4.content)
+
+            # G5：覆盖记录缺失 / 数据文件缺失 / 文件长度不符 -> 冷缓存，全部重新回源
+            def _version_dir(etag: str = etag_v1_current) -> Path:
+                """按覆盖记录里的 ETag 定位版本目录（目录名经过安全字符转义）。"""
+                for child in Path(cache_dir).iterdir():
+                    if not child.is_dir():
+                        continue
+                    meta = child / "covered.json"
+                    if meta.exists():
+                        try:
+                            if json.loads(meta.read_text()).get("etag") == etag:
+                                return child
+                        except json.JSONDecodeError:
+                            # 记录损坏场景：目录本身仍可按修改时间最新定位
+                            return child
+                # 冷缓存重建后尚未产生记录时，退化为唯一/最新版本目录
+                dirs = sorted(
+                    (p for p in Path(cache_dir).iterdir() if p.is_dir()),
+                    key=lambda p: p.stat().st_mtime,
+                )
+                assert dirs, f"no version dir under {cache_dir}"
+                return dirs[-1]
+
+            vdir = _version_dir()
+            (vdir / "covered.json").unlink()  # 覆盖记录缺失
+            proxy_proc = restart_proxy(proxy_proc, proxy_port, origin_port, cache_dir)
+            await wait_health(proxy)
+            await http.post(f"{origin}/admin/reset-stats")
+            r_cold1 = await http.get(f"{proxy}/video", headers={"Range": "bytes=100000-100999"})
+            ostats_g5 = (await http.get(f"{origin}/stats")).json()["stats"]
+            check("G5 覆盖记录缺失按冷缓存：重新回源且字节正确",
+                  r_cold1.status_code == 206 and ostats_g5["range_requests"] == 1
+                  and r_cold1.content == r_g1.content)
+            check("G5b 冷缓存重建被统计 cold_cache_resets",
+                  (await http.get(f"{proxy}/stats")).json()["cold_cache_resets"] >= 1)
+
+            vdir = _version_dir()
+            (vdir / "data.bin").unlink()  # 对应数据文件缺失
+            proxy_proc = restart_proxy(proxy_proc, proxy_port, origin_port, cache_dir)
+            await wait_health(proxy)
+            r_cold2 = await http.get(f"{proxy}/video", headers={"Range": "bytes=100000-100999"})
+            check("G5c 数据文件缺失按冷缓存：重新回源成功",
+                  r_cold2.status_code == 206 and r_cold2.content == r_g1.content)
+
+            vdir = _version_dir()
+            with open(vdir / "data.bin", "r+b") as fh:  # 文件长度不符
+                fh.truncate(10)
+            proxy_proc = restart_proxy(proxy_proc, proxy_port, origin_port, cache_dir)
+            await wait_health(proxy)
+            r_cold3 = await http.get(f"{proxy}/video", headers={"Range": "bytes=100000-100999"})
+            check("G5d 数据文件长度不符按冷缓存：重建后重新回源成功",
+                  r_cold3.status_code == 206 and r_cold3.content == r_g1.content)
+
+            # 损坏的 covered.json 也必须按冷缓存处理，而不是 500
+            vdir = _version_dir()
+            (vdir / "covered.json").write_text("{not-json")
+            proxy_proc = restart_proxy(proxy_proc, proxy_port, origin_port, cache_dir)
+            await wait_health(proxy)
+            r_cold4 = await http.get(f"{proxy}/video", headers={"Range": "bytes=100000-100999"})
+            check("G5e 覆盖记录损坏按冷缓存：请求仍成功",
+                  r_cold4.status_code == 206 and r_cold4.content == r_g1.content,
+                  f"status={r_cold4.status_code}")
+
+            # G6：截断导致补取失败时不能新增覆盖；强杀重启后该区间仍需回源
+            await http.post(f"{origin}/admin/fault", json={"mode": "truncate"})
+            r_fail_g = await http.get(f"{proxy}/video", headers={"Range": "bytes=300000-300999"})
+            check("G6 持续截断时补取失败返回 502", r_fail_g.status_code == 502)
+            state_fail = (await http.get(f"{proxy}/cache/state")).json()
+            covered_flat = [iv for v in state_fail["versions"] for iv in v["covered"]]
+            check("G6b 失败补取未新增任何覆盖（300000-300999 不在 covered 中）",
+                  all(not (s <= 300000 and e >= 300999) for s, e in covered_flat),
+                  f"covered={covered_flat}")
+            proxy_proc = restart_proxy(proxy_proc, proxy_port, origin_port, cache_dir)
+            await wait_health(proxy)
+            await http.post(f"{origin}/admin/fault", json={"mode": "none"})
+            await http.post(f"{origin}/admin/reset-stats")
+            r_retry_g = await http.get(f"{proxy}/video", headers={"Range": "bytes=300000-300999"})
+            ostats_g6 = (await http.get(f"{origin}/stats")).json()["stats"]
+            check("G6c 重启后失败过的区间仍需回源（证明未落盘登记）",
+                  r_retry_g.status_code == 206 and ostats_g6["range_requests"] == 1,
+                  f"range_requests={ostats_g6['range_requests']}")
+
+            # G7：一个缺口持续失败不耽误其他并行缺口补齐、落盘、登记
+            await http.post(f"{origin}/admin/fault",
+                            json={"mode": "truncate_range", "fault_range": [400000, 400999]})
+            await http.post(f"{origin}/admin/reset-stats")
+            t0 = time.monotonic()
+            r_bad, r_ok = await asyncio.gather(
+                http.get(f"{proxy}/video", headers={"Range": "bytes=400000-400999"}),
+                http.get(f"{proxy}/video", headers={"Range": "bytes=500000-500999"}),
+            )
+            parallel_elapsed = time.monotonic() - t0
+            check("G7 并行补取：坏缺口 502、好缺口 206 互不耽误",
+                  r_bad.status_code == 502 and r_ok.status_code == 206
+                  and parallel_elapsed < 5.0,
+                  f"bad={r_bad.status_code} ok={r_ok.status_code} elapsed={parallel_elapsed:.2f}s")
+            state_g7 = (await http.get(f"{proxy}/cache/state")).json()
+            covered_g7 = [iv for v in state_g7["versions"] for iv in v["covered"]]
+            check("G7b 好缺口已登记覆盖、坏缺口未登记",
+                  any(s <= 500000 and e >= 500999 for s, e in covered_g7)
+                  and not any(s <= 400000 and e >= 400999 for s, e in covered_g7),
+                  f"covered={covered_g7}")
+            # 强杀重启：好缺口零回源命中，坏缺口在故障清除后重新回源
+            proxy_proc = restart_proxy(proxy_proc, proxy_port, origin_port, cache_dir)
+            await wait_health(proxy)
+            await http.post(f"{origin}/admin/fault", json={"mode": "none"})
+            await http.post(f"{origin}/admin/reset-stats")
+            r_ok2 = await http.get(f"{proxy}/video", headers={"Range": "bytes=500000-500999"})
+            r_bad2 = await http.get(f"{proxy}/video", headers={"Range": "bytes=400000-400999"})
+            ostats_g7 = (await http.get(f"{origin}/stats")).json()["stats"]
+            check("G7c 重启后好缺口零回源命中、坏缺口重新回源补齐",
+                  r_ok2.status_code == 206 and r_bad2.status_code == 206
+                  and ostats_g7["range_requests"] == 1,
+                  f"range_requests={ostats_g7['range_requests']}")
+            truth_bad = await http.get(f"{origin}/video", headers={"Range": "bytes=400000-400999"})
+            check("G7d 坏缺口补齐后字节与源站一致", r_bad2.content == truth_bad.content)
+            await http.post(f"{origin}/admin/fault", json={"mode": "none"})
 
             pstats = (await http.get(f"{proxy}/stats")).json()
             print("\nproxy stats:", pstats)

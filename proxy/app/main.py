@@ -45,6 +45,10 @@ _stats = {
     "bytes_fetched": 0,
     "bytes_served": 0,
     "errors": 0,
+    # 持久化缓存相关计数（缓存层维护，/stats 时合并输出）
+    # restored_versions: 本次进程内成功从磁盘恢复覆盖记录的版本数
+    # cold_cache_resets: 覆盖记录/数据文件缺失或长度不符而按冷缓存重建的次数
+    # coverage_persisted: 缺口补齐并成功落盘登记覆盖的次数
 }
 
 
@@ -198,6 +202,9 @@ async def video(request: Request) -> Response:
     except UpstreamError as exc:
         logger.warning("upstream error: %s", exc)
         return _error(502, "upstream_error", str(exc))
+    except Exception as exc:  # noqa: BLE001 - 兜底，避免裸 500
+        logger.exception("unexpected proxy error")
+        return _error(502, "proxy_error", f"代理内部错误: {exc!r}")
 
     if len(data) != end - start + 1:
         return _error(502, "truncated_cache", "缓存读取长度异常")
@@ -219,7 +226,13 @@ async def video(request: Request) -> Response:
 
 @app.get("/stats")
 async def stats() -> JSONResponse:
-    return JSONResponse(_stats)
+    return JSONResponse({**_stats, **store.stats})
+
+
+@app.get("/cache/state")
+async def cache_state() -> JSONResponse:
+    """调试用：查看磁盘版本目录、内存版本覆盖区间与持久化计数。"""
+    return JSONResponse(await store.describe())
 
 
 @app.get("/healthz")
